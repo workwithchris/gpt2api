@@ -208,6 +208,114 @@ docker compose logs -f | grep "Resolved model"
 
 ---
 
+## Using it from other tools
+
+Any OpenAI-compatible client works with:
+
+- **Base URL**: `http://localhost:8000/v1`
+- **API key**: anything (ignored — e.g. `dummy`, `not-needed`)
+- **Model**: `auto`, or any slug from `GET /v1/models`
+
+If the client runs on another machine or in another container, replace `localhost` with this
+machine's LAN IP (and make sure port 8000 is reachable).
+
+### Read this first: what is *not* supported
+
+This proxy is a thin text-chat bridge. It does **not** implement:
+
+- ❌ **tool / function calling** — `tools`, `tool_choice`, `tool_calls` are ignored.
+- ❌ **images / audio** — text content only.
+- ❌ **`response_format` / JSON mode**, **logprobs**, `n`, `temperature`, `top_p` (ignored).
+- ❌ **server-side history** — every request is a new conversation. Send the full message list
+  each time; the proxy flattens it into one prompt.
+
+**Consequence:** agentic tools that depend on tool calling (Claude Code, Cursor Agent, Cline,
+OpenCode's tool loop, etc.) will either fail or degrade badly. This proxy is best for chat-style
+completions, scripts, and simple assistants.
+
+### Claude Code
+
+Claude Code speaks the **Anthropic Messages API**, not OpenAI, so it cannot point directly at this
+proxy. Use a translation layer (e.g. LiteLLM, `claude-code-router`) that exposes an Anthropic-shaped
+endpoint and forwards to `http://localhost:8000/v1`, e.g.:
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:4000   # the translation proxy, not this one
+```
+
+Given the missing tool-calling support, Claude Code is unlikely to work well even with a translator.
+
+### OpenCode
+
+`~/.config/opencode/opencode.json` (or a project `opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "gpt2api": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "gpt2api",
+      "options": { "baseURL": "http://localhost:8000/v1", "apiKey": "dummy" },
+      "models": {
+        "auto": { "name": "Auto" },
+        "gpt-5-6-mini": { "name": "GPT-5.6 Mini" }
+      }
+    }
+  }
+}
+```
+
+### Cursor
+
+`Settings → Models → OpenAI API Key` → enter any key, enable **Override OpenAI Base URL** and set it
+to `http://localhost:8000/v1`. Add the model slug (e.g. `auto`) under custom models.
+
+### Cline / Roo Code (VS Code)
+
+Provider: **OpenAI Compatible**. Base URL `http://localhost:8000/v1`, any API key, model id from
+`/v1/models`. Disable tools/agent mode — only plain chat works.
+
+### Continue.dev
+
+`~/.continue/config.json`:
+
+```json
+{
+  "models": [
+    {
+      "title": "gpt2api",
+      "provider": "openai",
+      "model": "auto",
+      "apiBase": "http://localhost:8000/v1",
+      "apiKey": "dummy"
+    }
+  ]
+}
+```
+
+### Aider
+
+```bash
+aider --openai-api-base http://localhost:8000/v1 \
+      --openai-api-key dummy \
+      --model openai/auto
+```
+
+### Python (OpenAI SDK, LangChain, LlamaIndex)
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")
+```
+
+```python
+from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(base_url="http://localhost:8000/v1", api_key="dummy", model="auto")
+```
+
+---
+
 ## How it works
 
 Per request, `chatgpt_client.py` does:

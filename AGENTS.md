@@ -24,6 +24,15 @@ Turnstile are solved in pure Python.
 - Upstream error events (`{"error": ..., "error_code": ...}`) are raised as `RuntimeError` and
   surfaced as HTTP 502 / an SSE error chunk. Free-plan limits show up as `usage_limit`.
 
+## Behaviour caveats
+
+- Requests are **stateless**: `stream()` sends one user message and starts a fresh conversation each
+  call. Multi-turn context only exists if the caller resends the whole message list (flattened by
+  `format_prompt`).
+- Only plain text is supported. `tools`/`function calling`, images, `response_format`/JSON mode,
+  `temperature`, `top_p`, and `n` are **not** implemented — do not claim otherwise in docs or tests.
+  Agentic clients that need tool calling will not work well.
+
 ## Commands
 
 ```bash
