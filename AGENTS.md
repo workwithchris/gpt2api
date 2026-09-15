@@ -6,7 +6,11 @@ Turnstile are solved in pure Python.
 
 ## Layout
 
-- `main.py` — FastAPI layer only (`/v1/models`, `/v1/chat/completions`, CLI). No protocol logic.
+- `main.py` — FastAPI layer only (`/v1/models`, `/v1/chat/completions`, `/admin/*`, CLI). No protocol logic.
+- `admin_ui.py` — single-file HTML/JS admin page served at `GET /`. No build step, no framework.
+- `host_agent.py` — optional host-side helper (stdlib `http.server`, loopback `:8001`) that the admin
+  page calls directly from the browser to run the browser-token import when the API runs in Docker.
+- `browser_token.py` — reads a token from a locally logged-in Chrome/Arc (macOS only, `browser_cookie3`).
 - `chatgpt_client.py` — all protocol code: bootstrap, sentinel prepare/finalize, PoW,
   Turnstile bytecode solver, `f/conversation/prepare` (conduit), SSE streaming.
   Public entrypoint: `ChatGPTClient.stream(prompt, model) -> Iterator[str]` (blocking, `curl_cffi`).
@@ -55,6 +59,7 @@ venv/bin/pip install -r requirements.txt
 docker compose up -d --build          # container, mounts ./session_data.json
 venv/bin/python main.py --port 8000   # host
 venv/bin/python main.py --import-token  # read access token from local browser (macOS only)
+venv/bin/python host_agent.py           # loopback helper so the Docker admin page can import a token
 
 # syntax check (no test suite, no linter configured)
 venv/bin/python -m py_compile main.py chatgpt_client.py
@@ -67,7 +72,10 @@ Verify: `curl -s localhost:8000/v1/models`, then a `/v1/chat/completions` reques
 
 - **Anonymous (default)**: no config. Uses `backend-anon`.
 - **Authenticated**: `CHATGPT_ACCESS_TOKEN` env, or `session_data.json`, or `--access-token`.
-  Uses `backend-api`. Token is read once at startup by `get_client()` — restart to pick up a new one.
+  Uses `backend-api`. Read at startup by `get_client()`, but the admin UI / `POST /admin/token`
+  hot-reloads the client via `set_client()` — restart is not needed for UI changes.
+- Admin routes are guarded by `ADMIN_KEY` when set (`_check_admin`); the page takes `?key=` and
+  forwards it as `X-Admin-Key`.
 
 ## Hard-won protocol constraints (do not "simplify" away)
 

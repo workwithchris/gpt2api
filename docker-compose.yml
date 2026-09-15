@@ -9,4 +9,6 @@ services:
     environment:
       # Optional: authenticated mode. Leave empty to run anonymously.
       - CHATGPT_ACCESS_TOKEN=${CHATGPT_ACCESS_TOKEN:-}
+      # Optional: protect the admin UI at http://localhost:8000/ (recommended if the port is exposed)
+      - ADMIN_KEY=${ADMIN_KEY:-}
     restart: unless-stopped

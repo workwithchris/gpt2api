@@ -120,6 +120,55 @@ Pick **one** of these:
 
 ---
 
+## Web UI (easiest way to enable authenticated mode)
+
+Open **http://localhost:8000/** in a browser. No CLI, no restart.
+
+The page shows the current mode/account/model count and lets you:
+
+- **Paste an access token** and click *Save & enable* — validated against ChatGPT first; a bad token
+  is rejected and the previous working session is kept.
+- **Import token from browser** — one button, two paths: when the proxy runs on the host it reads
+  Chrome/Arc directly; when it runs in Docker it automatically relays through the host helper below.
+- **Reload from file** — hot-reloads a token written by the CLI or the host helper.
+- **Refresh models** — re-fetches the model list for the current session.
+- **Test** — sends a real prompt and shows the resolved model + reply.
+
+Enabling a token takes effect **immediately** (the client is hot-reloaded); no restart required.
+The token is persisted to `session_data.json`.
+
+### Importing a token when running in Docker
+
+The container cannot read your browser profiles or macOS Keychain. Run the tiny host helper:
+
+```bash
+venv/bin/python host_agent.py        # listens on 127.0.0.1:8001 only
+```
+
+Then click **Import token from browser** on the admin page (your browser calls the helper directly on
+localhost; nothing is exposed to the network). Alternatively:
+
+```bash
+venv/bin/python main.py --import-token   # writes session_data.json
+# then click "Reload from session_data.json"  (or: curl -X POST localhost:8000/admin/reload)
+```
+
+If the proxy runs on the host (`venv/bin/python main.py`), the plain **Import from browser** button
+works and no helper is needed.
+
+Protect the page if port 8000 is reachable by others:
+
+```bash
+ADMIN_KEY=mysecret docker compose up -d
+# then open http://localhost:8000/?key=mysecret
+```
+
+The admin routes are `GET /admin/status`, `POST /admin/token`, `POST /admin/import`,
+`POST /admin/reload`, `POST /admin/models/refresh`, `POST /admin/test` (send `X-Admin-Key` when
+`ADMIN_KEY` is set).
+
+---
+
 ## API
 
 Base URL: `http://localhost:8000/v1` — `api_key` can be anything.
@@ -313,6 +362,9 @@ Sentinel and conduit tokens are short-lived, so a fresh pair is fetched for ever
 | File | Purpose |
 | --- | --- |
 | `main.py` | FastAPI layer + CLI. No protocol logic. |
+| `admin_ui.py` | Single-file admin page served at `/`. |
+| `host_agent.py` | Optional host-side helper (loopback `:8001`) so the admin page can import a browser token when the proxy runs in Docker. |
+| `browser_token.py` | Reads an access token from a locally logged-in Chrome/Arc (macOS). Used by `--import-token` and the host helper. |
 | `chatgpt_client.py` | All protocol code (sentinel, PoW, Turnstile, conduit, SSE). |
 | `session_data.json` | Optional access token. Must be a **file** (see Gotchas). |
 | `Dockerfile`, `docker-compose.yml` | Container build/run. No browser installed. |

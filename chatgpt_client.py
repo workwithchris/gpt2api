@@ -710,6 +710,37 @@ class ChatGPTClient:
         self._models_ts = 0.0
         self._models_lock = threading.Lock()
 
+    # -- account -----------------------------------------------------------
+    def whoami(self) -> Optional[Dict[str, Any]]:
+        """Return the authenticated account (id/email/name) or None."""
+        if not self.authenticated:
+            return None
+        try:
+            session = self._session()
+            try:
+                resp = session.get(f"{BASE_URL}/backend-api/me", timeout=20)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return {"id": data.get("id"), "email": data.get("email"), "name": data.get("name"), "plan": data.get("plan_type")}
+            finally:
+                session.close()
+        except Exception as e:
+            logger.debug("whoami failed: %s", e)
+        return None
+
+    def valid_token(self) -> bool:
+        """Cheap check that the current access token is accepted by the backend."""
+        if not self.authenticated:
+            return False
+        try:
+            session = self._session()
+            try:
+                return session.get(f"{BASE_URL}/backend-api/me", timeout=20).status_code == 200
+            finally:
+                session.close()
+        except Exception:
+            return False
+
     # -- models ------------------------------------------------------------
     def list_models(self, ttl: float = 600) -> List[Dict[str, Any]]:
         """Return the account's available models, fetched from the web backend.

@@ -21,19 +21,26 @@ import os
 import sys
 import time
 import uuid
-from typing import List
+from typing import List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from admin_ui import PAGE
+from browser_token import read_local_browser_token
 from chatgpt_client import ChatGPTClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("chatgpt-web-proxy")
 
 TOKEN_FILE = os.path.abspath("./session_data.json")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()
+# Browser cookie reading needs the host's browser profiles + Keychain, so it only works when this
+# process runs directly on the machine (not inside the container).
+IN_CONTAINER = os.path.exists("/.dockerenv")
+CAN_IMPORT = not IN_CONTAINER
 
 app = FastAPI(title="ChatGPT Web OpenAI-Compatible Proxy")
 
@@ -110,45 +117,133 @@ def format_prompt(messages: List[ChatMessage]) -> str:
     return "\n\n".join(parts)
 
 
-def import_token() -> int:
-    """Read a ChatGPT access token from a locally logged-in browser (one-time)."""
-    try:
-        import browser_cookie3
-        import urllib.request
-    except ImportError:
-        print("[TOKEN] browser_cookie3 not installed. Run: pip install browser_cookie3")
-        return 1
-
-    import urllib.request
-
-    cookie_header = ""
-    for reader in (browser_cookie3.arc, browser_cookie3.chrome):
-        try:
-            jar = list(reader(domain_name="chatgpt.com"))
-        except Exception:
-            continue
-        if any(c.name.startswith("__Secure-next-auth.session-token") for c in jar):
-            cookie_header = "; ".join(f"{c.name}={c.value}" for c in jar)
-            break
-
-    if not cookie_header:
-        print("[TOKEN] No logged-in ChatGPT session found in a local browser.")
-        return 1
-
-    req = urllib.request.Request(
-        "https://chatgpt.com/api/auth/session",
-        headers={"Cookie": cookie_header, "User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read())
-    token = (data.get("accessToken") or "").strip()
-    if not token:
-        print("[TOKEN] Session found but no access token (expired login?).")
-        return 1
+def save_access_token(token: str) -> None:
     with open(TOKEN_FILE, "w") as f:
         json.dump({"access_token": token, "updated_at": int(time.time())}, f, indent=2)
-    print(f"[TOKEN] Saved to {TOKEN_FILE}. Start the proxy with: python main.py")
-    return 0
+
+
+def set_client(access_token: str) -> ChatGPTClient:
+    """Swap the active client (hot reload — no restart needed)."""
+    global _client
+    _client = ChatGPTClient(access_token=access_token)
+    logger.info(f"ChatGPT client reloaded (mode={'authenticated' if access_token else 'anonymous'}).")
+    return _client
+
+
+# --- admin UI ---------------------------------------------------------------
+
+def _check_admin(request: Request) -> None:
+    if not ADMIN_KEY:
+        return
+    key = request.headers.get("x-admin-key") or request.query_params.get("key", "")
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin key.")
+
+
+class TokenRequest(BaseModel):
+    access_token: str = ""
+
+
+class TestRequest(BaseModel):
+    prompt: str = "Reply with exactly: ok"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def admin_page(request: Request):
+    _check_admin(request)
+    return HTMLResponse(PAGE)
+
+
+@app.get("/admin/status")
+async def admin_status(request: Request):
+    _check_admin(request)
+    client = get_client()
+    account = None
+    model_count = 0
+    if client.authenticated:
+        account = await asyncio.to_thread(client.whoami)
+        try:
+            model_count = len(await asyncio.to_thread(client.list_models))
+        except Exception:
+            model_count = 0
+    return {
+        "authenticated": client.authenticated,
+        "account": account,
+        "model_count": model_count,
+        "token_file": os.path.exists(TOKEN_FILE),
+        "admin_key_required": bool(ADMIN_KEY),
+        "can_import": CAN_IMPORT,
+    }
+
+
+@app.post("/admin/reload")
+async def admin_reload(request: Request):
+    """Re-read session_data.json into the running client (no restart)."""
+    _check_admin(request)
+    token = load_access_token()
+    set_client(token)
+    return {"ok": True, "authenticated": get_client().authenticated}
+
+
+@app.post("/admin/token")
+async def admin_set_token(payload: TokenRequest, request: Request):
+    _check_admin(request)
+    token = payload.access_token.strip()
+    previous = get_client().access_token
+    if token:
+        client = set_client(token)
+        if not await asyncio.to_thread(client.valid_token):
+            set_client(previous)  # keep the working session
+            raise HTTPException(status_code=400, detail="Token rejected by ChatGPT. Check it and try again.")
+        save_access_token(token)
+    else:
+        set_client("")
+        save_access_token("")
+    return {"ok": True, "authenticated": get_client().authenticated}
+
+
+@app.post("/admin/import")
+async def admin_import(request: Request):
+    _check_admin(request)
+    if not CAN_IMPORT:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Browser import is unavailable inside Docker (it cannot read your machine's browser "
+                "profiles or Keychain). Run 'venv/bin/python main.py --import-token' on the host, "
+                "then click Reload."
+            ),
+        )
+    try:
+        token = await asyncio.to_thread(read_local_browser_token)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    set_client(token)
+    save_access_token(token)
+    return {"ok": True, "authenticated": True}
+
+
+@app.post("/admin/models/refresh")
+async def admin_refresh_models(request: Request):
+    _check_admin(request)
+    client = get_client()
+    client._models_cache = None
+    client._models_ts = 0
+    models = await asyncio.to_thread(client.list_models)
+    return {"ok": True, "count": len(models), "models": [m["id"] for m in models]}
+
+
+@app.post("/admin/test")
+async def admin_test(payload: TestRequest, request: Request):
+    _check_admin(request)
+    resolved: dict = {}
+    try:
+        text = await asyncio.to_thread(
+            lambda: "".join(get_client().stream(payload.prompt, model="auto", resolved=resolved))
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"ok": True, "model": resolved.get("slug") or "auto", "content": text}
 
 
 @app.get("/v1/models")

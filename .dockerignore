@@ -12,3 +12,4 @@ browser_data/
 
 .DS_Store
 AGENTS.md
+host_agent.py
