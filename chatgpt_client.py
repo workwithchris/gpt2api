@@ -681,11 +681,47 @@ def solve_turnstile(dx: str, key: str, script_sources: Optional[Sequence[str]] =
 # Client
 # ---------------------------------------------------------------------------
 
+_TRANSIENT_MARKERS = (
+    "Connection closed abruptly", "Recv failure", "Send failure", "Could not connect",
+    "Operation timed out", "curl: (56)", "curl: (52)", "curl: (7)", "curl: (28)", "curl: (35)",
+)
+
+
+def _is_transient(error: Exception) -> bool:
+    text = str(error)
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _retry(call, attempts: int = 3, delay: float = 0.4):
+    """Run a network call, retrying the drops Cloudflare sometimes causes."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as e:
+            if attempt == attempts or not _is_transient(e):
+                raise
+            logger.warning("transient network error (attempt %d/%d): %s", attempt, attempts, str(e)[:100])
+            time.sleep(delay * attempt)
+
+
+def _expiry(payload: Dict[str, Any]) -> float:
+    """Absolute expiry (epoch seconds) of a sentinel token, 0 when unknown."""
+    if isinstance(payload.get("expire_at"), (int, float)):
+        return float(payload["expire_at"])
+    if isinstance(payload.get("expire_after"), (int, float)):
+        return time.time() + float(payload["expire_after"])
+    return 0.0
+
+
 class SentinelToken:
-    def __init__(self, token: str, proof_token: str = "", turnstile_token: str = ""):
+    def __init__(self, token: str, proof_token: str = "", turnstile_token: str = "", expire_at: float = 0.0):
         self.token = token
         self.proof_token = proof_token
         self.turnstile_token = turnstile_token
+        self.expire_at = expire_at
+
+    def fresh(self, margin: float = 15.0) -> bool:
+        return self.expire_at == 0.0 or self.expire_at > time.time() + margin
 
     def as_headers(self) -> Dict[str, str]:
         headers = {"OpenAI-Sentinel-Chat-Requirements-Token": self.token}
@@ -709,6 +745,42 @@ class ChatGPTClient:
         self._models_cache: Optional[List[Dict[str, Any]]] = None
         self._models_ts = 0.0
         self._models_lock = threading.Lock()
+        self._prefetched: Optional[SentinelToken] = None
+        self._sentinel_lock = threading.Lock()
+        self._prefetching = False
+
+    # -- sentinel prefetch -------------------------------------------------
+    def _take_sentinel(self, session: requests.Session, sources: List[str]) -> SentinelToken:
+        """Return a ready sentinel token, refilling in the background for the next request."""
+        with self._sentinel_lock:
+            prefetched = self._prefetched
+            self._prefetched = None
+        if prefetched is not None and prefetched.fresh():
+            self._schedule_prefetch()
+            return prefetched
+        token = self._sentinel(session, sources)
+        self._schedule_prefetch()
+        return token
+
+    def _schedule_prefetch(self) -> None:
+        with self._sentinel_lock:
+            if self._prefetching or (self._prefetched is not None and self._prefetched.fresh()):
+                return
+            self._prefetching = True
+        threading.Thread(target=self._prefetch_sentinel, daemon=True).start()
+
+    def _prefetch_sentinel(self) -> None:
+        try:
+            session = self._session()
+            sources = self._bootstrap(session)
+            token = self._sentinel(session, sources)
+            with self._sentinel_lock:
+                self._prefetched = token
+        except Exception as e:
+            logger.debug("sentinel prefetch failed: %s", e)
+        finally:
+            with self._sentinel_lock:
+                self._prefetching = False
 
     # -- account -----------------------------------------------------------
     def whoami(self) -> Optional[Dict[str, Any]]:
@@ -732,14 +804,13 @@ class ChatGPTClient:
         """Cheap check that the current access token is accepted by the backend."""
         if not self.authenticated:
             return False
+        session = self._session()
         try:
-            session = self._session()
-            try:
-                return session.get(f"{BASE_URL}/backend-api/me", timeout=20).status_code == 200
-            finally:
-                session.close()
+            return session.get(f"{BASE_URL}/backend-api/me", timeout=20).status_code == 200
         except Exception:
             return False
+        finally:
+            session.close()
 
     # -- models ------------------------------------------------------------
     def list_models(self, ttl: float = 600) -> List[Dict[str, Any]]:
@@ -790,6 +861,7 @@ class ChatGPTClient:
 
     # -- session -----------------------------------------------------------
     def _session(self) -> requests.Session:
+        """Create a fresh session (keep-alive reuse gets killed by Cloudflare mid-request)."""
         s = requests.Session(impersonate="firefox133")
         headers = {
             "User-Agent": self.user_agent,
@@ -813,7 +885,7 @@ class ChatGPTClient:
     def _bootstrap(self, session: requests.Session) -> List[str]:
         if self._sources:
             return self._sources
-        resp = session.get(
+        resp = _retry(lambda: session.get(
             BASE_URL + "/",
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -823,7 +895,7 @@ class ChatGPTClient:
                 "Upgrade-Insecure-Requests": "1",
             },
             timeout=30,
-        )
+        ))
         resp.raise_for_status()
         self._sources, _ = parse_resources(resp.text)
         return self._sources
@@ -843,12 +915,12 @@ class ChatGPTClient:
         p_token = build_requirements_token(config)
 
         path = "/backend-api/sentinel/chat-requirements/prepare"
-        resp = session.post(
+        resp = _retry(lambda: session.post(
             BASE_URL + path,
             headers={"Content-Type": "application/json", **self._target_headers(path)},
             json={"p": p_token},
             timeout=30,
-        )
+        ))
         resp.raise_for_status()
         data = resp.json()
         prepare_token = data.get("prepare_token", "")
@@ -866,17 +938,18 @@ class ChatGPTClient:
             turnstile_token = solve_turnstile(ts_info["dx"], p_token, sources) or ""
 
         path = "/backend-api/sentinel/chat-requirements/finalize"
-        resp = session.post(
+        resp = _retry(lambda: session.post(
             BASE_URL + path,
             headers={"Content-Type": "application/json", **self._target_headers(path)},
             json={"prepare_token": prepare_token, "proof_token": proof_token, "turnstile_token": turnstile_token},
             timeout=30,
-        )
+        ))
         resp.raise_for_status()
-        token = resp.json().get("token", "")
+        data = resp.json()
+        token = data.get("token", "")
         if not token:
             raise RuntimeError(f"missing sentinel token: {resp.text[:300]}")
-        return SentinelToken(token, proof_token, turnstile_token)
+        return SentinelToken(token, proof_token, turnstile_token, _expiry(data))
 
     def _sentinel_anonymous(self, session: requests.Session, sources: List[str]) -> SentinelToken:
         source = random.choice(sources) if sources else SENTINEL_SDK_FALLBACK
@@ -884,12 +957,12 @@ class ChatGPTClient:
         p_token = anon_requirements_token(config)
 
         path = "/backend-anon/sentinel/chat-requirements/prepare"
-        resp = session.post(
+        resp = _retry(lambda: session.post(
             BASE_URL + path,
             headers={"Content-Type": "application/json", **self._target_headers(path)},
             json={"p": p_token},
             timeout=30,
-        )
+        ))
         resp.raise_for_status()
         data = resp.json()
         prepare_token = data.get("prepare_token", "")
@@ -907,17 +980,18 @@ class ChatGPTClient:
             turnstile_token = solve_turnstile(ts_info["dx"], p_token, sources) or ""
 
         path = "/backend-anon/sentinel/chat-requirements/finalize"
-        resp = session.post(
+        resp = _retry(lambda: session.post(
             BASE_URL + path,
             headers={"Content-Type": "application/json", **self._target_headers(path)},
             json={"prepare_token": prepare_token, "proofofwork": proof_token, "turnstile": turnstile_token},
             timeout=30,
-        )
+        ))
         resp.raise_for_status()
-        token = resp.json().get("token", "")
+        data = resp.json()
+        token = data.get("token", "")
         if not token:
             raise RuntimeError(f"missing sentinel token: {resp.text[:300]}")
-        return SentinelToken(token, proof_token, turnstile_token)
+        return SentinelToken(token, proof_token, turnstile_token, _expiry(data))
 
     # -- attachments -------------------------------------------------------
     def _fetch_attachment(self, session: requests.Session, url: str) -> tuple[Optional[bytes], str]:
@@ -1085,12 +1159,12 @@ class ChatGPTClient:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
-        resp = session.post(
+        resp = _retry(lambda: session.post(
             BASE_URL + path,
             headers={"Content-Type": "application/json", "Accept": "*/*", "X-Conduit-Token": "no-token", **self._target_headers(path)},
             json=body,
             timeout=60,
-        )
+        ))
         resp.raise_for_status()
         conduit_token = str(resp.json().get("conduit_token") or "")
         if not conduit_token:
@@ -1186,16 +1260,41 @@ class ChatGPTClient:
         resolved: Optional[Dict[str, Any]] = None,
         attachments: Optional[Sequence[str]] = None,
     ) -> Iterator[str]:
-        """Yield assistant text deltas for a single-turn prompt.
+        """Yield assistant text deltas, retrying the whole handshake when ChatGPT flakes.
 
         `attachments` are image/file URLs, `data:` URIs, or local paths; they are uploaded and
         attached to the user message. `resolved`, when given, is filled with
         `{"slug": <model actually used>}` as soon as the backend reports it.
         """
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            produced = False
+            try:
+                for delta in self._stream_once(prompt, model, resolved, attachments):
+                    produced = True
+                    yield delta
+                return
+            except Exception as e:
+                # Retry only genuine connection failures. "Unusual activity" 403s are an account-level
+                # abuse flag: retrying multiplies the offending traffic and makes it worse.
+                if produced or attempt == attempts or not _is_transient(e):
+                    raise
+                self.device_id = new_uuid()
+                logger.warning("chat completion failed (attempt %d/%d), rotating device id: %s",
+                               attempt, attempts, str(e)[:100])
+                time.sleep(1.0 * attempt)
+
+    def _stream_once(
+        self,
+        prompt: str,
+        model: str = "auto",
+        resolved: Optional[Dict[str, Any]] = None,
+        attachments: Optional[Sequence[str]] = None,
+    ) -> Iterator[str]:
         session = self._session()
         try:
             sources = self._bootstrap(session)
-            sentinel = self._sentinel(session, sources)
+            sentinel = self._take_sentinel(session, sources)
             conduit_token = self._prepare_conversation(session, model)
             user_message = self._user_message(session, prompt, attachments or [])
 
@@ -1223,8 +1322,16 @@ class ChatGPTClient:
                 **sentinel.as_headers(),
                 **self._target_headers(path),
             }
-            resp = session.post(BASE_URL + path, headers=headers, json=payload, timeout=300, stream=True)
-            resp.raise_for_status()
+            resp = _retry(lambda: session.post(BASE_URL + path, headers=headers, json=payload, timeout=300, stream=True))
+            if resp.status_code != 200:
+                detail = (resp.text or "")[:200]
+                if "Unusual activity" in detail or resp.status_code == 403:
+                    raise RuntimeError(
+                        "ChatGPT refused this request (HTTP 403). This is normally the account-level "
+                        "'unusual activity' limit: stop sending requests for a while, slow down, or use "
+                        "a paid account. Headers and tokens are fine — /backend-api/me and /models still work."
+                    )
+                raise RuntimeError(f"conversation request failed (HTTP {resp.status_code}): {detail}")
 
             current = ""
             try:
