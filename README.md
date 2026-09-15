@@ -208,7 +208,7 @@ docker compose logs -f | grep "Resolved model"
 
 ---
 
-## Using it from other tools
+## Compatibility
 
 Any OpenAI-compatible client works with:
 
@@ -219,100 +219,73 @@ Any OpenAI-compatible client works with:
 If the client runs on another machine or in another container, replace `localhost` with this
 machine's LAN IP (and make sure port 8000 is reachable).
 
-### Read this first: what is *not* supported
+### What is *not* supported
 
-This proxy is a thin text-chat bridge. It does **not** implement:
+This proxy is a thin chat bridge. It does **not** implement:
 
 - ❌ **tool / function calling** — `tools`, `tool_choice`, `tool_calls` are ignored.
-- ❌ **images / audio** — text content only.
+- ❌ **audio** (TTS/STT, voice mode).
 - ❌ **`response_format` / JSON mode**, **logprobs**, `n`, `temperature`, `top_p` (ignored).
 - ❌ **server-side history** — every request is a new conversation. Send the full message list
   each time; the proxy flattens it into one prompt.
 
-**Consequence:** agentic tools that depend on tool calling (Claude Code, Cursor Agent, Cline,
-OpenCode's tool loop, etc.) will either fail or degrade badly. This proxy is best for chat-style
+**Supported:** text chat, **images (vision)**, and **file attachments** (PDF, text, code, office
+docs) — the latter two in authenticated mode only.
+
+Agentic tools that depend on tool calling will not work well. This proxy is best for chat-style
 completions, scripts, and simple assistants.
 
-### Claude Code
+### Images and file attachments
 
-Claude Code speaks the **Anthropic Messages API**, not OpenAI, so it cannot point directly at this
-proxy. Use a translation layer (e.g. LiteLLM, `claude-code-router`) that exposes an Anthropic-shaped
-endpoint and forwards to `http://localhost:8000/v1`, e.g.:
+Send OpenAI-style `content` parts. Both remote URLs and `data:` URIs work, plus local file paths.
 
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:4000   # the translation proxy, not this one
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What word is in this image?"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/pic.png"}}
+      ]
+    }]
+  }'
 ```
 
-Given the missing tool-calling support, Claude Code is unlikely to work well even with a translator.
-
-### OpenCode
-
-`~/.config/opencode/opencode.json` (or a project `opencode.json`):
+Base64 (no hosting needed):
 
 ```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "gpt2api": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "gpt2api",
-      "options": { "baseURL": "http://localhost:8000/v1", "apiKey": "dummy" },
-      "models": {
-        "auto": { "name": "Auto" },
-        "gpt-5-6-mini": { "name": "GPT-5.6 Mini" }
-      }
-    }
-  }
-}
+{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
 ```
 
-### Cursor
-
-`Settings → Models → OpenAI API Key` → enter any key, enable **Override OpenAI Base URL** and set it
-to `http://localhost:8000/v1`. Add the model slug (e.g. `auto`) under custom models.
-
-### Cline / Roo Code (VS Code)
-
-Provider: **OpenAI Compatible**. Base URL `http://localhost:8000/v1`, any API key, model id from
-`/v1/models`. Disable tools/agent mode — only plain chat works.
-
-### Continue.dev
-
-`~/.continue/config.json`:
+Files use the `file` part with `file_data`:
 
 ```json
-{
-  "models": [
-    {
-      "title": "gpt2api",
-      "provider": "openai",
-      "model": "auto",
-      "apiBase": "http://localhost:8000/v1",
-      "apiKey": "dummy"
-    }
-  ]
-}
+{"type": "file", "file": {"file_data": "data:application/pdf;base64,JVBERi0xLjQ..."}}
 ```
 
-### Aider
+How it works: attachments are uploaded to ChatGPT (`POST /backend-api/files` → blob `PUT` →
+confirm), then referenced from the user message as `image_asset_pointer` parts and
+`metadata.attachments`. Images and documents **require authenticated mode** (the anon API has no
+file endpoints) — without a token the request fails with a clear error.
 
-```bash
-aider --openai-api-base http://localhost:8000/v1 \
-      --openai-api-key dummy \
-      --model openai/auto
-```
-
-### Python (OpenAI SDK, LangChain, LlamaIndex)
+Python:
 
 ```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")
+resp = client.chat.completions.create(
+    model="auto",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this image."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        ],
+    }],
+)
 ```
 
-```python
-from langchain_openai import ChatOpenAI
-llm = ChatOpenAI(base_url="http://localhost:8000/v1", api_key="dummy", model="auto")
-```
 
 ---
 

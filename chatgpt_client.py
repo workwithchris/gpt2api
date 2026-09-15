@@ -16,8 +16,11 @@ firefox133 (Cloudflare rejects chrome* fingerprints).
 
 import base64
 import hashlib
+import io
 import json
 import logging
+import mimetypes
+import os
 import random
 import re
 import threading
@@ -51,6 +54,26 @@ SENTINEL_SDK_FALLBACK = f"{BASE_URL}/backend-api/sentinel/sdk.js"
 # Used when the upstream model list cannot be fetched (e.g. anonymous mode).
 FALLBACK_MODELS = ["auto", "gpt-4o", "gpt-4o-mini"]
 
+# Attachment handling (mirrors the web client's file upload flow).
+MULTIMODAL_MIME_TYPES = ["image/jpeg", "image/webp", "image/png", "image/gif"]
+MY_FILES_MIME_TYPES = [
+    "text/plain", "text/markdown", "text/html", "text/css", "text/xml", "text/csv",
+    "application/json", "application/xml", "application/pdf", "application/zip",
+    "application/msword", "application/rtf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "text/javascript", "text/x-python", "text/x-script.python", "text/x-java",
+    "text/x-c", "text/x-c++", "text/x-csharp", "text/x-php", "text/x-ruby",
+    "text/x-typescript", "text/x-sh", "text/x-tex", "application/x-latex",
+]
+MIME_EXTENSIONS = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+    "application/pdf": ".pdf", "application/json": ".json", "application/zip": ".zip",
+    "text/plain": ".txt", "text/markdown": ".md", "text/html": ".html", "text/csv": ".csv",
+}
+DEFAULT_MIME = "application/octet-stream"
+
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
@@ -58,6 +81,30 @@ def new_uuid() -> str:
 
 def _utf8_b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def determine_use_case(mime_type: str) -> str:
+    if mime_type in MULTIMODAL_MIME_TYPES:
+        return "multimodal"
+    if mime_type in MY_FILES_MIME_TYPES:
+        return "my_files"
+    return "ace_upload"
+
+
+def file_extension(mime_type: str) -> str:
+    return MIME_EXTENSIONS.get(mime_type, "")
+
+
+def image_size(content: bytes) -> tuple[Optional[int], Optional[int]]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, None
+    try:
+        with Image.open(io.BytesIO(content)) as img:
+            return img.width, img.height
+    except Exception:
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +888,155 @@ class ChatGPTClient:
             raise RuntimeError(f"missing sentinel token: {resp.text[:300]}")
         return SentinelToken(token, proof_token, turnstile_token)
 
+    # -- attachments -------------------------------------------------------
+    def _fetch_attachment(self, session: requests.Session, url: str) -> tuple[Optional[bytes], str]:
+        """Return (content, mime_type) for an http(s) URL, a data: URI, or a file path."""
+        if url.startswith("data:"):
+            header, _, payload = url.partition(",")
+            mime = header.split(";")[0].split(":")[1] or DEFAULT_MIME
+            try:
+                return base64.b64decode(payload), mime
+            except Exception:
+                return None, mime
+        if url.startswith(("http://", "https://")):
+            try:
+                resp = session.get(url, timeout=60)
+                if resp.status_code != 200:
+                    logger.warning("attachment fetch failed (%s): %s", resp.status_code, url)
+                    return None, DEFAULT_MIME
+                mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip() or DEFAULT_MIME
+                return resp.content, mime
+            except Exception as e:
+                logger.warning("attachment fetch error: %s", e)
+                return None, DEFAULT_MIME
+        if os.path.exists(url):
+            try:
+                with open(url, "rb") as f:
+                    content = f.read()
+                mime = mimetypes.guess_type(url)[0] or DEFAULT_MIME
+                return content, mime
+            except Exception as e:
+                logger.warning("attachment read error: %s", e)
+        return None, DEFAULT_MIME
+
+    def upload_file(self, session: requests.Session, content: bytes, mime_type: str) -> Optional[Dict[str, Any]]:
+        """Upload one attachment and return its metadata (None on failure)."""
+        if not content or not mime_type:
+            return None
+
+        width = height = None
+        if mime_type.startswith("image/"):
+            width, height = image_size(content)
+        file_size = len(content)
+        file_name = f"{uuid.uuid4()}{file_extension(mime_type)}"
+        use_case = determine_use_case(mime_type)
+
+        # 1. ask for an upload slot
+        create = session.post(
+            f"{BASE_URL}/{self.base}/files",
+            headers={"Content-Type": "application/json", "Accept": "*/*"},
+            json={
+                "file_name": file_name,
+                "file_size": file_size,
+                "reset_rate_limits": False,
+                "timezone_offset_min": -480,
+                "use_case": use_case,
+            },
+            timeout=30,
+        )
+        if create.status_code != 200:
+            logger.error("upload slot failed (%s): %s", create.status_code, create.text[:200])
+            return None
+        payload = create.json()
+        file_id = payload.get("file_id")
+        upload_url = payload.get("upload_url")
+        if not file_id or not upload_url:
+            return None
+
+        # 2. push the bytes to the blob store (no auth headers on this host)
+        blob_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": mime_type,
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-version": "2020-04-08",
+        }
+        blob = session.put(upload_url, headers=blob_headers, data=content, timeout=120)
+        if blob.status_code not in (200, 201):
+            logger.error("blob upload failed (%s): %s", blob.status_code, blob.text[:200])
+            return None
+
+        # 3. confirm the upload
+        session.post(f"{BASE_URL}/{self.base}/files/{file_id}/uploaded", headers={"Content-Type": "application/json"}, json={}, timeout=30)
+
+        # 4. documents need to finish server-side indexing before use
+        if use_case == "my_files":
+            for _ in range(30):
+                try:
+                    check = session.get(f"{BASE_URL}/{self.base}/files/{file_id}", timeout=10)
+                    if check.status_code == 200 and check.json().get("retrieval_index_status") == "success":
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+
+        return {
+            "file_id": file_id,
+            "file_name": file_name,
+            "size_bytes": file_size,
+            "mime_type": mime_type,
+            "width": width,
+            "height": height,
+            "use_case": use_case,
+        }
+
+    def _user_message(self, session: requests.Session, text: str, attachments: Sequence[str]) -> Dict[str, Any]:
+        """Build a user message, uploading any attachments first."""
+        if not attachments:
+            return self._message(text)
+        if not self.authenticated:
+            raise RuntimeError("Attachments require authenticated mode (set an access token).")
+
+        parts: List[Any] = []
+        if text:
+            parts.append(text)
+        attachment_meta: List[Dict[str, Any]] = []
+        for source in attachments:
+            content, mime_type = self._fetch_attachment(session, source)
+            if not content:
+                logger.warning("skipping attachment: %s", source[:80])
+                continue
+            meta = self.upload_file(session, content, mime_type)
+            if not meta:
+                continue
+            if mime_type.startswith("image/"):
+                parts.append({
+                    "content_type": "image_asset_pointer",
+                    "asset_pointer": f"file-service://{meta['file_id']}",
+                    "size_bytes": meta["size_bytes"],
+                    "width": meta["width"],
+                    "height": meta["height"],
+                })
+                attachment_meta.append({
+                    "id": meta["file_id"], "size": meta["size_bytes"], "name": meta["file_name"],
+                    "mime_type": meta["mime_type"], "width": meta["width"], "height": meta["height"],
+                })
+            else:
+                attachment_meta.append({
+                    "id": meta["file_id"], "size": meta["size_bytes"], "name": meta["file_name"],
+                    "mime_type": meta["mime_type"],
+                })
+
+        if not attachment_meta:
+            return self._message(text)
+
+        return {
+            "id": new_uuid(),
+            "author": {"role": "user"},
+            "create_time": time.time(),
+            "content": {"content_type": "multimodal_text", "parts": parts},
+            "metadata": {"attachments": attachment_meta},
+        }
+
     # -- conversation ------------------------------------------------------
     def _prepare_conversation(self, session: requests.Session, model: str) -> str:
         path = f"/{self.base}/f/conversation/prepare"
@@ -952,22 +1148,30 @@ class ChatGPTClient:
                     return found
         return None
 
-    def stream(self, prompt: str, model: str = "auto", resolved: Optional[Dict[str, Any]] = None) -> Iterator[str]:
+    def stream(
+        self,
+        prompt: str,
+        model: str = "auto",
+        resolved: Optional[Dict[str, Any]] = None,
+        attachments: Optional[Sequence[str]] = None,
+    ) -> Iterator[str]:
         """Yield assistant text deltas for a single-turn prompt.
 
-        `resolved`, when given, is filled with `{"slug": <model actually used>}` as soon as the
-        backend reports it.
+        `attachments` are image/file URLs, `data:` URIs, or local paths; they are uploaded and
+        attached to the user message. `resolved`, when given, is filled with
+        `{"slug": <model actually used>}` as soon as the backend reports it.
         """
         session = self._session()
         try:
             sources = self._bootstrap(session)
             sentinel = self._sentinel(session, sources)
             conduit_token = self._prepare_conversation(session, model)
+            user_message = self._user_message(session, prompt, attachments or [])
 
             path = f"/{self.base}/f/conversation"
             payload: Dict[str, Any] = {
                 "action": "next",
-                "messages": [self._message(prompt)],
+                "messages": [user_message],
                 "parent_message_id": "client-created-root",
                 "model": model,
                 "client_prepare_state": "success",

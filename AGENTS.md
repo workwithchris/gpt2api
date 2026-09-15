@@ -29,9 +29,21 @@ Turnstile are solved in pure Python.
 - Requests are **stateless**: `stream()` sends one user message and starts a fresh conversation each
   call. Multi-turn context only exists if the caller resends the whole message list (flattened by
   `format_prompt`).
-- Only plain text is supported. `tools`/`function calling`, images, `response_format`/JSON mode,
-  `temperature`, `top_p`, and `n` are **not** implemented — do not claim otherwise in docs or tests.
-  Agentic clients that need tool calling will not work well.
+- Only plain text plus **images and file attachments** are supported. `tools`/`function calling`,
+  audio, `response_format`/JSON mode, `temperature`, `top_p`, and `n` are **not** implemented — do
+  not claim otherwise in docs or tests. Agentic clients that need tool calling will not work well.
+
+## Attachments (images / files)
+
+- `ChatGPTClient.stream(..., attachments=[url])` accepts http(s) URLs, `data:` URIs, or local paths.
+- Flow: `POST /{base}/files` (slot) -> blob `PUT` (`x-ms-blob-type: BlockBlob`, **auth headers must
+  be removed**) -> `POST /files/{id}/uploaded` -> for non-images poll `GET /files/{id}` until
+  `retrieval_index_status == "success"`.
+- Message shape: `content_type: multimodal_text`; images become
+  `{"content_type": "image_asset_pointer", "asset_pointer": "file-service://<id>", ...}` parts;
+  documents only appear in `metadata.attachments`.
+- **Authenticated mode only** — `backend-anon` has no file endpoints; `_user_message` raises.
+- `Pillow` is used only to read image dimensions for the pointer parts.
 
 ## Commands
 

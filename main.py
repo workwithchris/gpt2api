@@ -55,6 +55,24 @@ class ChatMessage(BaseModel):
             return "\n".join(parts)
         return str(self.content)
 
+    def get_attachments(self) -> list:
+        """Image/file URLs from OpenAI-style `content` parts."""
+        urls = []
+        if isinstance(self.content, list):
+            for item in self.content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "image_url":
+                    image = item.get("image_url")
+                    if isinstance(image, str):
+                        urls.append(image)
+                    elif isinstance(image, dict) and image.get("url"):
+                        urls.append(image["url"])
+                elif item.get("type") == "file" and isinstance(item.get("file"), dict):
+                    if item["file"].get("file_data"):
+                        urls.append(item["file"]["file_data"])
+        return urls
+
 
 class ChatCompletionRequest(BaseModel):
     model: str = "auto"
@@ -158,7 +176,14 @@ async def chat_completions(req: ChatCompletionRequest):
     model = req.model or "auto"
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
-    logger.info(f"Completion {req_id} model={model} stream={req.stream} mode={'auth' if get_client().authenticated else 'anon'}")
+
+    attachments: list = []
+    for message in reversed(req.messages):
+        if message.role == "user":
+            attachments = message.get_attachments()
+            break
+
+    logger.info(f"Completion {req_id} model={model} stream={req.stream} attachments={len(attachments)} mode={'auth' if get_client().authenticated else 'anon'}")
 
     if req.stream:
         async def generator():
@@ -168,7 +193,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
             def produce():
                 try:
-                    for delta in get_client().stream(prompt, model=model, resolved=resolved):
+                    for delta in get_client().stream(prompt, model=model, resolved=resolved, attachments=attachments):
                         loop.call_soon_threadsafe(queue.put_nowait, ("delta", delta))
                     loop.call_soon_threadsafe(queue.put_nowait, ("end", None))
                 except Exception as e:  # surface upstream errors
@@ -208,7 +233,7 @@ async def chat_completions(req: ChatCompletionRequest):
     resolved: dict = {}
 
     def collect() -> str:
-        return "".join(get_client().stream(prompt, model=model, resolved=resolved))
+        return "".join(get_client().stream(prompt, model=model, resolved=resolved, attachments=attachments))
 
     try:
         text = await asyncio.to_thread(collect)
