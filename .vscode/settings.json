@@ -1,0 +1,12 @@
+{
+  "python.defaultInterpreterPath": "./venv/bin/python",
+  "python.pythonPath": "./venv/bin/python",
+  "python.analysis.extraPaths": [
+    "./venv/lib/python3.13/site-packages"
+  ],
+  "python.autoComplete.extraPaths": [
+    "./venv/lib/python3.13/site-packages"
+  ],
+  "python.analysis.indexing": true,
+  "python.analysis.typeCheckingMode": "basic"
+}

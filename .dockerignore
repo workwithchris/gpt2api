@@ -1,0 +1,14 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+
+# Never ship the access token in the build context (compose mount still works at runtime)
+session_data.json
+browser_data/
+
+.DS_Store
+AGENTS.md

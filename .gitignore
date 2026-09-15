@@ -1,0 +1,15 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets — contains a live ChatGPT access token
+session_data.json
+.env
+
+# Removed browser approach leftovers
+browser_data/
+
+# OS / editor
+.DS_Store

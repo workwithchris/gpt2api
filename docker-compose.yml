@@ -1,0 +1,12 @@
+services:
+  gpt2api:
+    build: .
+    container_name: gpt2api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./session_data.json:/app/session_data.json
+    environment:
+      # Optional: authenticated mode. Leave empty to run anonymously.
+      - CHATGPT_ACCESS_TOKEN=${CHATGPT_ACCESS_TOKEN:-}
+    restart: unless-stopped
