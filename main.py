@@ -117,7 +117,11 @@ def format_prompt(messages: List[ChatMessage]) -> str:
     return "\n\n".join(parts)
 
 
-def save_access_token(token: str) -> None:
+def save_access_token(token: str, allow_empty: bool = False) -> None:
+    """Persist the token. Empty values are ignored unless explicitly clearing."""
+    if not token and not allow_empty:
+        logger.warning("Refusing to overwrite the stored token with an empty value.")
+        return
     with open(TOKEN_FILE, "w") as f:
         json.dump({"access_token": token, "updated_at": int(time.time())}, f, indent=2)
 
@@ -131,6 +135,18 @@ def set_client(access_token: str) -> ChatGPTClient:
 
 
 # --- admin UI ---------------------------------------------------------------
+
+def import_token() -> int:
+    """CLI: read a token from a local browser and persist it."""
+    try:
+        token = read_local_browser_token()
+    except Exception as e:
+        print(f"[TOKEN] {e}")
+        return 1
+    save_access_token(token, allow_empty=False)
+    print(f"[TOKEN] Saved to {TOKEN_FILE}. Start the proxy with: python main.py")
+    return 0
+
 
 def _check_admin(request: Request) -> None:
     if not ADMIN_KEY:
@@ -198,7 +214,7 @@ async def admin_set_token(payload: TokenRequest, request: Request):
         save_access_token(token)
     else:
         set_client("")
-        save_access_token("")
+        save_access_token("", allow_empty=True)
     return {"ok": True, "authenticated": get_client().authenticated}
 
 

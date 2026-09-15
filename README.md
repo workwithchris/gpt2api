@@ -120,22 +120,25 @@ Pick **one** of these:
 
 ---
 
-## Web UI (easiest way to enable authenticated mode)
+## Web UI (chat + settings)
 
-Open **http://localhost:8000/** in a browser. No CLI, no restart.
+Open **http://localhost:8000/**. Two panes:
 
-The page shows the current mode/account/model count and lets you:
+**Left sidebar**
+- **History** — past chats, stored in your browser's `localStorage` (nothing is kept server-side).
+  *New chat*, click to reopen, `×` to delete.
+- **Settings** — model picker (populated from `GET /v1/models`), access-token field, and the
+  `Save` / `Import` / `Reload` / `Clear` actions plus the account line.
 
-- **Paste an access token** and click *Save & enable* — validated against ChatGPT first; a bad token
-  is rejected and the previous working session is kept.
-- **Import token from browser** — one button, two paths: when the proxy runs on the host it reads
-  Chrome/Arc directly; when it runs in Docker it automatically relays through the host helper below.
-- **Reload from file** — hot-reloads a token written by the CLI or the host helper.
-- **Refresh models** — re-fetches the model list for the current session.
-- **Test** — sends a real prompt and shows the resolved model + reply.
+**Right pane** — the chat itself. Streaming responses, Enter to send, Shift+Enter for a newline.
+Each answer shows the resolved model the backend actually used.
 
-Enabling a token takes effect **immediately** (the client is hot-reloaded); no restart required.
-The token is persisted to `session_data.json`.
+The chat calls the same public endpoint clients use (`POST /v1/chat/completions`), so anything that
+works here works from any OpenAI-compatible client. Errors from upstream (rate limits, flags) appear
+inline under the message.
+
+Enabling a token takes effect **immediately** (hot reload); no restart. The token is persisted to
+`session_data.json`.
 
 ### Importing a token when running in Docker
 
@@ -362,7 +365,7 @@ Sentinel and conduit tokens are short-lived, so a fresh pair is fetched for ever
 | File | Purpose |
 | --- | --- |
 | `main.py` | FastAPI layer + CLI. No protocol logic. |
-| `admin_ui.py` | Single-file admin page served at `/`. |
+| `admin_ui.py` | Single-file chat + settings UI served at `/`. No build step, no framework. |
 | `host_agent.py` | Optional host-side helper (loopback `:8001`) so the admin page can import a browser token when the proxy runs in Docker. |
 | `browser_token.py` | Reads an access token from a locally logged-in Chrome/Arc (macOS). Used by `--import-token` and the host helper. |
 | `chatgpt_client.py` | All protocol code (sentinel, PoW, Turnstile, conduit, SSE). |

@@ -7,7 +7,9 @@ Turnstile are solved in pure Python.
 ## Layout
 
 - `main.py` — FastAPI layer only (`/v1/models`, `/v1/chat/completions`, `/admin/*`, CLI). No protocol logic.
-- `admin_ui.py` — single-file HTML/JS admin page served at `GET /`. No build step, no framework.
+- `admin_ui.py` — single-file chat + settings page served at `GET /` (sidebar with localStorage chat
+  history + settings, right pane chat that streams from `/v1/chat/completions`). No build step, no
+  framework; Tailwind via CDN. Chat history lives in the browser only.
 - `host_agent.py` — optional host-side helper (stdlib `http.server`, loopback `:8001`) that the admin
   page calls directly from the browser to run the browser-token import when the API runs in Docker.
 - `browser_token.py` — reads a token from a locally logged-in Chrome/Arc (macOS only, `browser_cookie3`).
